@@ -28,6 +28,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import time
 import torch.nn.functional as F
 
+from logger_utils import TrainingLogger
+from mlp_predictors import CovarianceMLP, AlphaMLP, ConfigurableMLP
+
+
 def parse_args():
   parser = argparse.ArgumentParser()
   parser.add_argument('image_file', type=str)
@@ -59,14 +63,27 @@ def parse_args():
   parser.add_argument('--show', action='store_true')
 
   parser.add_argument('--profile', action='store_true')
-  
+
+  for attr in ['position', 'feature', 'covariance', 'alpha']:
+    parser.add_argument(f'--use_mlp_{attr}', action='store_true')
+    parser.add_argument(f'--freeze_mlp_{attr}', action='store_true')
+    parser.add_argument(f'--load_mlp_{attr}', type=str, default=None)
+    parser.add_argument(f'--save_mlp_{attr}', type=str, default=None)
+    parser.add_argument(f'--mlp_{attr}_layers', type=str, default="32")
+    parser.add_argument(f'--mlp_{attr}_activation', type=str, default="ReLU")
+
+  parser.add_argument('--latent_dim', type=int, default=16)
+  parser.add_argument('--save_csv', type=str, default=None, help='Filename to save training log as CSV')
+
   args = parser.parse_args()
+
+  for attr in ['position', 'feature', 'covariance', 'alpha']:
+    setattr(args, f'mlp_{attr}_layers', list(map(int, getattr(args, f'mlp_{attr}_layers').split(','))))
 
   if args.pixel_tile:
     args.pixel_tile = tuple(map(int, args.pixel_tile.split(',')))
 
   return args
-
 
 def log_lerp(t, a, b):
   return math.exp(math.log(b) * t + math.log(a) * (1 - t))
@@ -87,11 +104,13 @@ def psnr(a, b):
   return 10 * torch.log10(1 / torch.nn.functional.mse_loss(a, b))  
 
 def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image, 
-        config:RasterConfig,        
+        config:RasterConfig,
         epoch_size=100, 
         grad_alpha=0.9, 
         opacity_reg=0.0,
-        scale_reg=0.0):
+        scale_reg=0.0,
+        mlps: dict = {},
+        mlp_optimizers: dict = {}):
     
   h, w = ref_image.shape[:2]
 
@@ -100,9 +119,37 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
 
   for i in range(epoch_size):
     opt.zero_grad()
+    for optim in mlp_optimizers.values():
+      optim.zero_grad()
 
     with torch.enable_grad():
       gaussians = Gaussians2D.from_tensordict(params.tensors)
+
+      latent = params.latent if 'latent' in params.tensors else None
+
+      if 'position' in mlps:
+        gaussians.position = mlps['position'](latent)
+      else:
+        gaussians.position = params.position
+
+      if 'feature' in mlps:
+        gaussians.feature = mlps['feature'](latent)
+      else:
+        gaussians.feature = params.feature
+
+      if 'covariance' in mlps:
+        cov_out = mlps['covariance'](latent)
+        gaussians.log_scaling = torch.clamp(cov_out[..., :2], min=-5, max=5)
+        gaussians.rotation = F.normalize(cov_out[..., 2:], dim=-1)
+      else:
+        gaussians.log_scaling = params.log_scaling
+        gaussians.rotation = params.rotation
+
+      if 'alpha' in mlps:
+        gaussians.alpha_logit = mlps['alpha'](latent).squeeze(-1)
+      else:
+        gaussians.alpha_logit = params.alpha_logit
+
       gaussians2d = project_gaussians2d(gaussians)  
 
       raster = rasterize(gaussians2d=gaussians2d, 
@@ -119,7 +166,8 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
               + scale_reg * scale.pow(2).mean())
 
       loss.backward()
-
+      for optim in mlp_optimizers.values():
+        optim.step()
 
     check_finite(gaussians, 'gaussians')
     visibility = raster.visibility
@@ -135,10 +183,11 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
       opt.step(indexes = visible, 
               basis=point_basis(gaussians[visible]))
 
-    params.replace(
-      rotation = torch.nn.functional.normalize(params.rotation.detach()),
-      log_scaling = torch.clamp(params.log_scaling.detach(), min=-5, max=5)
-    )
+    if 'covariance' not in mlps:
+      params.replace(
+        rotation=torch.nn.functional.normalize(params.rotation.detach()),
+        log_scaling=torch.clamp(params.log_scaling.detach(), min=-5, max=5)
+      )
 
     point_heuristic +=  raster.point_heuristic
     visibility += raster.visibility
@@ -213,8 +262,8 @@ def split_prune(params:ParameterClass, t, target, prune_rate, split_heuristic:Tu
 
   to_split = params[split_mask]
 
-  
   splits = uniform_split_gaussians2d(Gaussians2D.from_tensordict(to_split.tensors), random_axis=True)
+  splits = splits.to(params.position.device)  # Ensure splits are on the correct device
   optim_state = to_split.tensor_state.new_zeros(to_split.batch_size[0], 2)
 
   # optim_state['position']['running_vis'][:] = to_split.tensor_state['position']['running_vis'].unsqueeze(1) * 0.5
@@ -231,6 +280,8 @@ def split_prune(params:ParameterClass, t, target, prune_rate, split_heuristic:Tu
 
 
 def main():
+  logger = TrainingLogger()
+
   torch.set_printoptions(precision=4, sci_mode=False)
 
   cmd_args = parse_args()
@@ -260,17 +311,58 @@ def main():
 
   torch.manual_seed(cmd_args.seed)
   torch.cuda.random.manual_seed(cmd_args.seed)
-  gaussians = random_2d_gaussians(cmd_args.n, (w, h), alpha_range=(0.5, 1.0), scale_factor=0.5).to(torch.device('cuda:0'))
-  
-  parameter_groups = dict(
-    position=dict(lr=lr_range[0], type='local_vector'),
-    log_scaling=dict(lr=0.1),
+  gaussians = random_2d_gaussians(cmd_args.n, (w, h), alpha_range=(0.5, 1.0), scale_factor=0.5, latent_dim=16).to(torch.device('cuda:0'))
 
-    rotation=dict(lr=1.0),
-    alpha_logit=dict(lr=0.1),
-    feature=dict(lr=0.1, type='vector')
-  )
-  
+  mlps = {}
+  mlp_optimizers = {}
+  device = torch.device('cuda:0')
+
+  for attr in ['position', 'feature', 'covariance', 'alpha']:
+    if getattr(cmd_args, f'use_mlp_{attr}'):
+      out_dim = {
+        'position': 2,
+        'feature': 3,
+        'covariance': 4,
+        'alpha': 1,
+      }[attr]
+      mlp = ConfigurableMLP(
+        in_dim=cmd_args.latent_dim,
+        out_dim=out_dim,
+        hidden_layers=getattr(cmd_args, f'mlp_{attr}_layers'),
+        activation=getattr(cmd_args, f'mlp_{attr}_activation')
+      ).to(device)
+
+      path = getattr(cmd_args, f'load_mlp_{attr}')
+      if path:
+        mlp.load_state_dict(torch.load(path))
+        print(f"Loaded MLP for {attr} from {path}")
+
+      if getattr(cmd_args, f'freeze_mlp_{attr}'):
+        for param in mlp.parameters():
+          param.requires_grad = False
+      else:
+        optimizer = torch.optim.Adam(
+          filter(lambda p: p.requires_grad, mlp.parameters()),
+          lr=0.001, betas=(0.9, 0.99)
+        )
+        mlp_optimizers[attr] = optimizer
+
+      mlps[attr] = mlp
+
+  parameter_groups = {}
+  if not cmd_args.use_mlp_position:
+    parameter_groups['position'] = dict(lr=cmd_args.max_lr, type='local_vector')
+  if not cmd_args.use_mlp_feature:
+    parameter_groups['feature'] = dict(lr=0.1, type='vector')
+  if not cmd_args.use_mlp_covariance:
+    parameter_groups['log_scaling'] = dict(lr=0.1)
+    parameter_groups['rotation'] = dict(lr=1.0)
+  if not cmd_args.use_mlp_alpha:
+    parameter_groups['alpha_logit'] = dict(lr=0.1)
+
+  if any(getattr(cmd_args, f'use_mlp_{attr}') for attr in ['position', 'feature', 'covariance', 'alpha']):
+    parameter_groups['latent'] = dict(lr=0.01)
+
   # params = ParameterClass(gaussians.to_tensordict(), 
   #       parameter_groups, optimizer=SparseAdam, betas=(0.9, 0.95), eps=1e-16, bias_correction=True)
 
@@ -310,17 +402,22 @@ def main():
 
   pbar = tqdm(total=cmd_args.iters)
   iteration = 0
-  for  epoch_size in epochs:
+  for epoch_size in epochs:
 
     t = (iteration + epoch_size * 0.5) / cmd_args.iters
     params.set_learning_rate(position = log_lerp(t, *lr_range))
     metrics = {}
-
-    image, split_heuristic, epoch_time = train(params.optimizer, params, ref_image, 
-                                      epoch_size=epoch_size, config=config, 
-                                      opacity_reg=cmd_args.opacity_reg,
-                                      scale_reg=cmd_args.scale_reg)
-
+    image, split_heuristic, epoch_time = train(
+      params.optimizer,
+      params,
+      ref_image,
+      config=config,
+      epoch_size=epoch_size,
+      opacity_reg=cmd_args.opacity_reg,
+      scale_reg=cmd_args.scale_reg,
+      mlps=mlps,
+      mlp_optimizers=mlp_optimizers
+    )
 
     if cmd_args.show:
       display_image('rendered', image)
@@ -333,7 +430,12 @@ def main():
       cv2.imwrite(str(filename), 
                   (image.detach().clamp(0, 1) * 255).cpu().numpy())
 
-    metrics['CPSNR'] = psnr(ref_image, image).item()
+    psnr_value = psnr(ref_image, image).item()
+
+    # Log PSNR, iteration count, and number of points
+    logger.log(iteration=iteration, psnr=psnr_value, n_points=params.batch_size[0])
+
+    metrics['CPSNR'] = psnr_value
     metrics['n'] = params.batch_size[0]
 
     if cmd_args.prune and cmd_args.target is None:
@@ -356,6 +458,18 @@ def main():
     iteration += epoch_size
     pbar.update(epoch_size)
 
+  # logger.plot()
+
+  if cmd_args.save_csv:
+    logger.save_csv(cmd_args.save_csv)
+
+  for attr, mlp in mlps.items():
+    path = getattr(cmd_args, f'save_mlp_{attr}')
+    if path:
+      torch.save(mlp.state_dict(), path)
+      print(f"Saved MLP for {attr} to {path}")
+
+
 def with_benchmark(f):
   def g(*args , **kwargs):
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
@@ -368,5 +482,6 @@ def with_benchmark(f):
       print(prof_table)
       return result
   return g
-      
+
+if __name__ == '__main__':
   main()
