@@ -29,7 +29,7 @@ import time
 import torch.nn.functional as F
 
 from logger_utils import TrainingLogger
-from mlp_predictors import CovarianceMLP, AlphaMLP, ConfigurableMLP
+from mlp_predictors import ConfigurableMLP
 
 
 def parse_args():
@@ -74,6 +74,8 @@ def parse_args():
 
   parser.add_argument('--latent_dim', type=int, default=16)
   parser.add_argument('--save_csv', type=str, default=None, help='Filename to save training log as CSV')
+
+  parser.add_argument('--use_hash_encoding', action='store_true')
 
   args = parser.parse_args()
 
@@ -128,27 +130,30 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
       latent = params.latent if 'latent' in params.tensors else None
 
       if 'position' in mlps:
-        gaussians.position = mlps['position'](latent)
+          gaussians.position = mlps['position'](params.latent)
       else:
-        gaussians.position = params.position
+          gaussians.position = params.position
 
       if 'feature' in mlps:
-        gaussians.feature = mlps['feature'](latent)
+          input_feature = gaussians.position if mlps['feature'].use_hash_encoding else params.latent
+          gaussians.feature = mlps['feature'](input_feature)
       else:
-        gaussians.feature = params.feature
+          gaussians.feature = params.feature
 
       if 'covariance' in mlps:
-        cov_out = mlps['covariance'](latent)
-        gaussians.log_scaling = torch.clamp(cov_out[..., :2], min=-5, max=5)
-        gaussians.rotation = F.normalize(cov_out[..., 2:], dim=-1)
+          input_cov = gaussians.position if mlps['covariance'].use_hash_encoding else params.latent
+          cov_out = mlps['covariance'](input_cov)
+          gaussians.log_scaling = torch.clamp(cov_out[..., :2], min=-5, max=5)
+          gaussians.rotation = F.normalize(cov_out[..., 2:], dim=-1)
       else:
-        gaussians.log_scaling = params.log_scaling
-        gaussians.rotation = params.rotation
+          gaussians.log_scaling = params.log_scaling
+          gaussians.rotation = params.rotation
 
       if 'alpha' in mlps:
-        gaussians.alpha_logit = mlps['alpha'](latent).squeeze(-1)
+          input_alpha = gaussians.position if mlps['alpha'].use_hash_encoding else params.latent
+          gaussians.alpha_logit = mlps['alpha'](input_alpha).squeeze(-1)
       else:
-        gaussians.alpha_logit = params.alpha_logit
+          gaussians.alpha_logit = params.alpha_logit
 
       gaussians2d = project_gaussians2d(gaussians)  
 
@@ -178,10 +183,10 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
     if isinstance(opt, VisibilityOptimizer):
       opt.step(indexes = visible, 
               visibility=visibility[visible], 
-              basis=point_basis(gaussians[visible]))
+              basis=point_basis(gaussians[visible]).to(torch.float32))
     else:
       opt.step(indexes = visible, 
-              basis=point_basis(gaussians[visible]))
+              basis=point_basis(gaussians[visible]).to(torch.float32))
 
     if 'covariance' not in mlps:
       params.replace(
@@ -329,7 +334,8 @@ def main():
         in_dim=cmd_args.latent_dim,
         out_dim=out_dim,
         hidden_layers=getattr(cmd_args, f'mlp_{attr}_layers'),
-        activation=getattr(cmd_args, f'mlp_{attr}_activation')
+        activation=getattr(cmd_args, f'mlp_{attr}_activation'),
+        use_hash_encoding=(cmd_args.use_hash_encoding and attr != 'position')
       ).to(device)
 
       path = getattr(cmd_args, f'load_mlp_{attr}')
