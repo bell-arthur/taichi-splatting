@@ -103,7 +103,14 @@ def display_image(name, image):
     
 
 def psnr(a, b):
-  return 10 * torch.log10(1 / torch.nn.functional.mse_loss(a, b))  
+  return 10 * torch.log10(1 / torch.nn.functional.mse_loss(a, b))
+
+def normalize_position(position: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    """Normalize 2D positions to [0, 1] range for hash encoding."""
+    norm_pos = position.clone()
+    norm_pos[:, 0] = norm_pos[:, 0] / width
+    norm_pos[:, 1] = norm_pos[:, 1] / height
+    return norm_pos.clamp(0.0, 1.0)
 
 def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image, 
         config:RasterConfig,
@@ -135,23 +142,34 @@ def train_epoch(opt:FractionalAdam, params:ParameterClass, ref_image,
           gaussians.position = params.position
 
       if 'feature' in mlps:
-          input_feature = gaussians.position if mlps['feature'].use_hash_encoding else params.latent
-          gaussians.feature = mlps['feature'](input_feature)
+        if mlps['feature'].use_hash_encoding:
+            input_feature = normalize_position(gaussians.position, w, h)
+        else:
+            input_feature = params.latent
+
+        gaussians.feature = mlps['feature'](input_feature).contiguous().to(torch.float32)
       else:
           gaussians.feature = params.feature
 
       if 'covariance' in mlps:
-          input_cov = gaussians.position if mlps['covariance'].use_hash_encoding else params.latent
-          cov_out = mlps['covariance'](input_cov)
-          gaussians.log_scaling = torch.clamp(cov_out[..., :2], min=-5, max=5)
-          gaussians.rotation = F.normalize(cov_out[..., 2:], dim=-1)
+        if mlps['covariance'].use_hash_encoding:
+            input_cov = normalize_position(gaussians.position, w, h)
+        else:
+            input_cov = params.latent
+
+        cov_out = mlps['covariance'](input_cov).contiguous().to(torch.float32)
+        gaussians.log_scaling = torch.clamp(cov_out[..., :2], min=-5, max=5)
+        gaussians.rotation = F.normalize(cov_out[..., 2:], dim=-1)
       else:
           gaussians.log_scaling = params.log_scaling
           gaussians.rotation = params.rotation
 
       if 'alpha' in mlps:
-          input_alpha = gaussians.position if mlps['alpha'].use_hash_encoding else params.latent
-          gaussians.alpha_logit = mlps['alpha'](input_alpha).squeeze(-1)
+        if mlps['alpha'].use_hash_encoding:
+            input_alpha = normalize_position(gaussians.position, w, h)  # <-- normalize here
+        else:
+            input_alpha = params.latent
+        gaussians.alpha_logit = mlps['alpha'](input_alpha).squeeze(-1)
       else:
           gaussians.alpha_logit = params.alpha_logit
 
