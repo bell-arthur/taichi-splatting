@@ -1,5 +1,5 @@
-import torch.nn as nn
 import tinycudann as tcnn
+import torch.nn as nn
 
 
 class ConfigurableMLP(nn.Module):
@@ -18,7 +18,8 @@ class ConfigurableMLP(nn.Module):
                     "per_level_scale": 2.0
                 }
 
-            self.encoder = tcnn.Encoding(n_input_dims=2, encoding_config=hash_config)
+            self.encoder = tcnn.Encoding(
+                n_input_dims=2, encoding_config=hash_config)
             input_dim = self.encoder.n_output_dims
         else:
             self.encoder = None
@@ -32,7 +33,8 @@ class ConfigurableMLP(nn.Module):
             "n_hidden_layers": len(hidden_layers)
         }
 
-        self.mlp = tcnn.Network(n_input_dims=input_dim, n_output_dims=out_dim, network_config=network_config)
+        self.mlp = tcnn.Network(
+            n_input_dims=input_dim, n_output_dims=out_dim, network_config=network_config)
 
     def forward(self, x):
         if self.use_hash_encoding:

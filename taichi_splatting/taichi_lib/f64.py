@@ -1,6 +1,6 @@
-from taichi_splatting.taichi_lib.generic import make_library
 import taichi as ti
 
+from taichi_splatting.taichi_lib.generic import make_library
 
 funcs = make_library(ti.f64)
 
