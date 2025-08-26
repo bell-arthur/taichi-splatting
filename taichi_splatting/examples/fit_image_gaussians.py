@@ -2,7 +2,7 @@ import argparse
 import math
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import cv2
 import taichi as ti
@@ -95,10 +95,6 @@ def log_lerp(t, a, b):
     return math.exp(math.log(b) * t + math.log(a) * (1 - t))
 
 
-def lerp(t, a, b):
-    return b * t + a * (1 - t)
-
-
 def display_image(name, image):
     image = (image.detach().clamp(0, 1) * 255).to(torch.uint8)
     image = image.cpu().numpy()
@@ -108,7 +104,7 @@ def display_image(name, image):
 
 
 def psnr(a, b):
-    return 10 * torch.log10(1 / torch.nn.functional.mse_loss(a, b))
+    return 10 * torch.log10(1 / F.mse_loss(a, b))
 
 
 def normalize_position(position: torch.Tensor, width: int, height: int) -> torch.Tensor:
@@ -122,19 +118,21 @@ def normalize_position(position: torch.Tensor, width: int, height: int) -> torch
 def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 config: RasterConfig,
                 epoch_size=100,
-                grad_alpha=0.9,
                 opacity_reg=0.0,
                 scale_reg=0.0,
-                mlps: dict = {},
-                mlp_optimizers: dict = {}):
+                mlps: Optional[dict] = None,
+                mlp_optimizers: Optional[dict] = None):
 
     h, w = ref_image.shape[:2]
 
     point_heuristic = torch.zeros(
         (params.batch_size[0], 2), device=params.position.device)
-    visibility = torch.zeros(
-        (params.batch_size[0]), device=params.position.device)
     image = torch.zeros_like(ref_image)  # Initialize image
+
+    if mlps is None:
+        mlps = {}
+    if mlp_optimizers is None:
+        mlp_optimizers = {}
 
     for i in range(epoch_size):
         opt.zero_grad()
@@ -143,8 +141,6 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
 
         with torch.enable_grad():
             gaussians = Gaussians2D(**params.tensors)  # type: ignore[misc]
-
-            latent = params.latent if 'latent' in params.tensors else None
 
             if 'position' in mlps:
                 _mlp = mlps['position']
@@ -190,8 +186,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 _mlp = mlps['alpha']
                 _device = next(_mlp.parameters()).device
                 if _mlp.use_hash_encoding:
-                    input_alpha = normalize_position(
-                        gaussians.position, w, h)  # <-- normalize here
+                    input_alpha = normalize_position(gaussians.position, w, h)
                 else:
                     input_alpha = params.latent
                 input_alpha = input_alpha.to(dtype=torch.float32, device=_device)
@@ -210,7 +205,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
             image = raster.image
 
             scale = torch.exp(gaussians.log_scaling) / min(w, h)
-            loss = (torch.nn.functional.mse_loss(image, ref_image) +
+            loss = (F.mse_loss(image, ref_image) +
                     opacity_reg * gaussians.opacity.mean() +
                     scale_reg * scale.pow(2).mean())
 
@@ -219,8 +214,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 optim.step()
 
         check_finite(gaussians, 'gaussians')
-        visibility = raster.visibility
-        visible = (visibility > 1e-8).nonzero().squeeze(1)  # type: ignore[operator]
+        visible = (raster.visibility > 1e-8).nonzero().squeeze(1)  # type: ignore[operator]
 
         # Create subset of gaussians for visible points
         visible_gaussians = Gaussians2D(
@@ -235,7 +229,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
         
         if isinstance(opt, VisibilityOptimizer):
             opt.step(indexes=visible,  # type: ignore[arg-type]
-                     visibility=visibility[visible],  # type: ignore[index]
+                     visibility=raster.visibility[visible],  # type: ignore[index]
                      basis=point_basis(visible_gaussians).to(torch.float32))
         else:
             opt.step(indexes=visible,
@@ -244,14 +238,13 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
 
         if 'covariance' not in mlps:
             params.replace(
-                rotation=torch.nn.functional.normalize(
+                rotation=F.normalize(
                     params.rotation.detach()),
                 log_scaling=torch.clamp(
                     params.log_scaling.detach(), min=-5, max=5)
             )
 
         point_heuristic += raster.point_heuristic  # type: ignore[operator]
-        visibility += raster.visibility  # type: ignore[operator]
 
     return image, (point_heuristic[:, 0], point_heuristic[:, 1])
 
@@ -372,14 +365,17 @@ def main():
     torch.manual_seed(cmd_args.seed)
     lr_range = (cmd_args.max_lr, cmd_args.min_lr)
 
-    torch.manual_seed(cmd_args.seed)
     torch.cuda.random.manual_seed(cmd_args.seed)
-    gaussians = random_2d_gaussians(cmd_args.n, (w, h), alpha_range=(
-        0.5, 1.0), scale_factor=0.5, latent_dim=16).to(torch.device('cuda:0'))
+    gaussians = random_2d_gaussians(
+        cmd_args.n,
+        (w, h),
+        alpha_range=(0.5, 1.0),
+        scale_factor=0.5,
+        latent_dim=cmd_args.latent_dim,
+    ).to(device)
 
     mlps = {}
     mlp_optimizers = {}
-    device = torch.device('cuda:0')
 
     for attr in ['position', 'feature', 'covariance', 'alpha']:
         if getattr(cmd_args, f'use_mlp_{attr}'):
@@ -502,6 +498,7 @@ def main():
 
         metrics['CPSNR'] = psnr_value
         metrics['n'] = params.batch_size[0]
+        metrics['time_s'] = epoch_time
 
         if cmd_args.prune and cmd_args.target is None:
             cmd_args.target = cmd_args.n

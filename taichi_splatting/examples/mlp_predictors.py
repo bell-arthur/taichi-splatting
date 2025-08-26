@@ -1,12 +1,14 @@
 import tinycudann as tcnn
-import torch
 import torch.nn as nn
+from typing import List, Optional
 
 
 class ConfigurableMLP(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_layers=[32], activation='ReLU', use_hash_encoding=False, hash_config=None):
+    def __init__(self, in_dim: int, out_dim: int, hidden_layers: Optional[List[int]] = None, activation: str = 'ReLU', use_hash_encoding: bool = False, hash_config: Optional[dict] = None):
         super().__init__()
         self.use_hash_encoding = use_hash_encoding
+        if hidden_layers is None:
+            hidden_layers = [32]
 
         if use_hash_encoding:
             if hash_config is None:
@@ -50,7 +52,7 @@ class ConfigurableMLP(nn.Module):
         }
         return mapping.get(name, nn.ReLU)
 
-    def _build_mlp(self, in_dim: int, out_dim: int, hidden_layers, activation_name: str) -> nn.Sequential:
+    def _build_mlp(self, in_dim: int, out_dim: int, hidden_layers: List[int], activation_name: str) -> nn.Sequential:
         layers = []
         last_dim = in_dim
         Act = self._get_activation(activation_name)
