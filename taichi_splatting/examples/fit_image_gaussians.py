@@ -134,6 +134,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
         (params.batch_size[0], 2), device=params.position.device)
     visibility = torch.zeros(
         (params.batch_size[0]), device=params.position.device)
+    image = torch.zeros_like(ref_image)  # Initialize image
 
     for i in range(epoch_size):
         opt.zero_grad()
@@ -141,7 +142,7 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
             optim.zero_grad()
 
         with torch.enable_grad():
-            gaussians = Gaussians2D.from_tensordict(params.tensors)
+            gaussians = Gaussians2D(**params.tensors)  # type: ignore[misc]
 
             latent = params.latent if 'latent' in params.tensors else None
 
@@ -208,15 +209,27 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
 
         check_finite(gaussians, 'gaussians')
         visibility = raster.visibility
-        visible = (visibility > 1e-8).nonzero().squeeze(1)
+        visible = (visibility > 1e-8).nonzero().squeeze(1)  # type: ignore[operator]
 
+        # Create subset of gaussians for visible points
+        visible_gaussians = Gaussians2D(
+            position=gaussians.position[visible],
+            depths=gaussians.depths[visible],
+            log_scaling=gaussians.log_scaling[visible],
+            rotation=gaussians.rotation[visible],
+            alpha_logit=gaussians.alpha_logit[visible],
+            feature=gaussians.feature[visible],
+            latent=gaussians.latent[visible]
+        )
+        
         if isinstance(opt, VisibilityOptimizer):
-            opt.step(indexes=visible,
-                     visibility=visibility[visible],
-                     basis=point_basis(gaussians[visible]).to(torch.float32))
+            opt.step(indexes=visible,  # type: ignore[arg-type]
+                     visibility=visibility[visible],  # type: ignore[index]
+                     basis=point_basis(visible_gaussians).to(torch.float32))
         else:
             opt.step(indexes=visible,
-                     basis=point_basis(gaussians[visible]).to(torch.float32))
+                     weight=torch.ones_like(visible, dtype=torch.float32),
+                     basis=point_basis(visible_gaussians).to(torch.float32))
 
         if 'covariance' not in mlps:
             params.replace(
@@ -226,8 +239,8 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                     params.log_scaling.detach(), min=-5, max=5)
             )
 
-        point_heuristic += raster.point_heuristic
-        visibility += raster.visibility
+        point_heuristic += raster.point_heuristic  # type: ignore[operator]
+        visibility += raster.visibility  # type: ignore[operator]
 
     return image, (point_heuristic[:, 0], point_heuristic[:, 1])
 
@@ -290,7 +303,7 @@ def find_split_prune(n, target, n_prune, prune_cost, densify_score):
 def split_prune(params: ParameterClass, t, target, prune_rate, split_heuristic: Tuple[torch.Tensor, torch.Tensor]):
     n = params.batch_size[0]
 
-    prune_cost, split_heuristic = split_heuristic
+    prune_cost, split_score = split_heuristic
 
     split_mask, prune_mask = find_split_prune(n=n,
                                               target=target,
@@ -298,21 +311,21 @@ def split_prune(params: ParameterClass, t, target, prune_rate, split_heuristic: 
                                                   prune_rate * n * (1 - t)),
                                               # n_prune=int(prune_rate * n),
                                               prune_cost=prune_cost,
-                                              densify_score=split_heuristic)
+                                              densify_score=split_score)
 
     to_split = params[split_mask]
 
     splits = uniform_split_gaussians2d(
-        Gaussians2D.from_tensordict(to_split.tensors), random_axis=True)
+        Gaussians2D(**to_split.tensors), random_axis=True)  # type: ignore[misc]
     # Ensure splits are on the correct device
     splits = splits.to(params.position.device)
-    optim_state = to_split.tensor_state.new_zeros(to_split.batch_size[0], 2)
+    optim_state = to_split.tensor_state.new_zeros((to_split.batch_size[0], 2))  # type: ignore[arg-type]
 
     # optim_state['position']['running_vis'][:] = to_split.tensor_state['position']['running_vis'].unsqueeze(1) * 0.5
 
     params = params[~(split_mask | prune_mask)]
     params = params.append_tensors(
-        splits.to_tensordict(), optim_state.reshape(splits.batch_size))
+        splits.to_tensordict(), optim_state.reshape(splits.batch_size))  # type: ignore[attr-defined]
     # params.replace(rotation = torch.nn.functional.normalize(params.rotation.detach()))
 
     return params, dict(
@@ -413,8 +426,8 @@ def main():
                             parameter_groups, optimizer=VisibilityAwareLaProp,
                             vis_smooth=0.1, vis_beta=0.8, betas=(0.9, 0.9), eps=1e-16, bias_correction=True)
 
-    keys = set(params.keys())
-    trainable = set(params.optimized_keys())
+    keys = set(params.keys())  # type: ignore[arg-type]
+    trainable = set(params.optimized_keys())  # type: ignore[arg-type]
 
     print(f'attributes - trainable: {trainable} other: {keys - trainable}')
 

@@ -38,5 +38,5 @@ class ConfigurableMLP(nn.Module):
 
     def forward(self, x):
         if self.use_hash_encoding:
-            x = self.encoder(x)
+            x = self.encoder(x)  # type: ignore[misc]
         return self.mlp(x)
