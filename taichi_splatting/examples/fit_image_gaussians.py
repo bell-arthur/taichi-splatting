@@ -147,29 +147,37 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
             latent = params.latent if 'latent' in params.tensors else None
 
             if 'position' in mlps:
-                gaussians.position = mlps['position'](params.latent)
+                _mlp = mlps['position']
+                _device = next(_mlp.parameters()).device
+                gaussians.position = _mlp(params.latent.to(dtype=torch.float32, device=_device))
             else:
                 gaussians.position = params.position
 
             if 'feature' in mlps:
-                if mlps['feature'].use_hash_encoding:
+                _mlp = mlps['feature']
+                _device = next(_mlp.parameters()).device
+                if _mlp.use_hash_encoding:
                     input_feature = normalize_position(
                         gaussians.position, w, h)
                 else:
                     input_feature = params.latent
 
-                gaussians.feature = mlps['feature'](
+                input_feature = input_feature.to(dtype=torch.float32, device=_device)
+                gaussians.feature = _mlp(
                     input_feature).contiguous().to(torch.float32)
             else:
                 gaussians.feature = params.feature
 
             if 'covariance' in mlps:
-                if mlps['covariance'].use_hash_encoding:
+                _mlp = mlps['covariance']
+                _device = next(_mlp.parameters()).device
+                if _mlp.use_hash_encoding:
                     input_cov = normalize_position(gaussians.position, w, h)
                 else:
                     input_cov = params.latent
 
-                cov_out = mlps['covariance'](
+                input_cov = input_cov.to(dtype=torch.float32, device=_device)
+                cov_out = _mlp(
                     input_cov).contiguous().to(torch.float32)
                 gaussians.log_scaling = torch.clamp(
                     cov_out[..., :2], min=-5, max=5)
@@ -179,12 +187,15 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 gaussians.rotation = params.rotation
 
             if 'alpha' in mlps:
-                if mlps['alpha'].use_hash_encoding:
+                _mlp = mlps['alpha']
+                _device = next(_mlp.parameters()).device
+                if _mlp.use_hash_encoding:
                     input_alpha = normalize_position(
                         gaussians.position, w, h)  # <-- normalize here
                 else:
                     input_alpha = params.latent
-                gaussians.alpha_logit = mlps['alpha'](input_alpha).squeeze(-1)
+                input_alpha = input_alpha.to(dtype=torch.float32, device=_device)
+                gaussians.alpha_logit = _mlp(input_alpha).squeeze(-1)
             else:
                 gaussians.alpha_logit = params.alpha_logit
 
