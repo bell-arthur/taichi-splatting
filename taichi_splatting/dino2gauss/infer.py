@@ -6,7 +6,7 @@ from typing import Dict, Any, Tuple
 
 import torch
 
-from taichi_splatting.dino2gauss.model import Dino2GaussMLP
+from taichi_splatting.dino2gauss.model import Dino2GaussMLP, Dino2GaussConv
 from taichi_splatting.dino2gauss.utils import build_anchors, gather_latents, pack_gaussians
 
 
@@ -18,23 +18,31 @@ def load_cache_item(path: Path, device: torch.device) -> tuple[torch.Tensor, tor
   return features.to(device), target.to(device), meta
 
 
-def build_model_from_ckpt(ckpt_path: Path, device: torch.device) -> Dino2GaussMLP:
+def build_model_from_ckpt(ckpt_path: Path, device: torch.device):
   ckpt = torch.load(ckpt_path, map_location=device)
-  # Ensure we construct the model with the same K used during training
+  arch = ckpt.get('arch', 'mlp')
   k = int(ckpt.get('k', 1))
-  model = Dino2GaussMLP(
-    in_dim=int(ckpt['in_dim']),
-    hidden_layers=tuple(ckpt['hidden']),
-    offset_max=float(ckpt['offset_max']),
-    k=k,
-  )
+  if arch == 'conv':
+    model = Dino2GaussConv(
+      in_channels=int(ckpt['in_channels']),
+      hidden=int(ckpt.get('conv_hidden', 128)),
+      offset_max=float(ckpt['offset_max']),
+      k=k,
+    )
+  else:
+    model = Dino2GaussMLP(
+      in_dim=int(ckpt['in_dim']),
+      hidden_layers=tuple(ckpt['hidden']),
+      offset_max=float(ckpt['offset_max']),
+      k=k,
+    )
   model.load_state_dict(ckpt['model_state'], strict=True)
   model.to(device).eval()
-  return model
+  return model, arch
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description='Infer Gaussians from cached DINO features using trained MLP')
+  parser = argparse.ArgumentParser(description='Infer Gaussians from cached DINO features using trained model')
   parser.add_argument('--cache_item', type=str, required=True)
   parser.add_argument('--checkpoint', type=str, required=True)
   parser.add_argument('--out', type=str, required=True)
@@ -49,19 +57,24 @@ def main() -> None:
   Hf, Wf, C = features.shape
   H, W = target.shape[0], target.shape[1]
 
-  model = build_model_from_ckpt(Path(args.checkpoint), device)
+  model, arch = build_model_from_ckpt(Path(args.checkpoint), device)
 
   anchors = build_anchors(H=H, W=W, Hf=Hf, Wf=Wf, stride=args.stride, device=device)
-  feats = gather_latents(features, stride=args.stride)
-
-  ys = torch.arange(0, Hf, args.stride, device=device).float() / float(Hf)
-  xs = torch.arange(0, Wf, args.stride, device=device).float() / float(Wf)
-  gy, gx = torch.meshgrid(ys, xs, indexing='ij')
-  coords = torch.stack([gx, gy], dim=-1).view(-1, 2)
-  x_in = torch.cat([feats.to(dtype=torch.float32), coords], dim=-1)
+  if arch == 'conv':
+    x_in = None
+  else:
+    feats = gather_latents(features, stride=args.stride)
+    ys = torch.arange(0, Hf, args.stride, device=device).float() / float(Hf)
+    xs = torch.arange(0, Wf, args.stride, device=device).float() / float(Wf)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    coords = torch.stack([gx, gy], dim=-1).view(-1, 2)
+    x_in = torch.cat([feats.to(dtype=torch.float32), coords], dim=-1)
 
   with torch.no_grad():
-    preds = model(x_in)
+    if arch == 'conv':
+      preds = model(features, stride=args.stride)
+    else:
+      preds = model(x_in)
     g2d = pack_gaussians(anchors, preds, image_size=(H, W))
 
   out = Path(args.out)

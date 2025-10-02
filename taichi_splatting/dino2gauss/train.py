@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from taichi_splatting.dino2gauss.model import Dino2GaussMLP
+from taichi_splatting.dino2gauss.model import Dino2GaussMLP, Dino2GaussConv
 from taichi_splatting.dino2gauss.utils import build_anchors, gather_latents, pack_gaussians, pack_gaussians_tensor
 from taichi_splatting.data_types import RasterConfig
 from taichi_splatting.rasterizer.function import rasterize
@@ -34,7 +34,7 @@ def psnr(pred: torch.Tensor, tgt: torch.Tensor, eps: float = 1e-8) -> float:
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description='Train MLP to map DINO features to 2D Gaussians')
+  parser = argparse.ArgumentParser(description='Train model to map DINO features to 2D Gaussians')
   parser.add_argument('--cache_dir', type=str, required=True)
   parser.add_argument('--epochs', type=int, default=10)
   parser.add_argument('--stride', type=int, default=1)
@@ -46,6 +46,8 @@ def main() -> None:
   parser.add_argument('--scale_reg', type=float, default=1e-1)
   parser.add_argument('--save_ckpt', type=str, default='models/dino2gauss_mlp.pth')
   parser.add_argument('--device', type=str, default='cuda')
+  parser.add_argument('--arch', type=str, choices=['mlp', 'conv'], default='mlp')
+  parser.add_argument('--conv_hidden', type=int, default=128)
   args = parser.parse_args()
 
   device = torch.device(args.device if torch.cuda.is_available() and 'cuda' in args.device else 'cpu')
@@ -66,8 +68,12 @@ def main() -> None:
   H, W = target0.shape[0], target0.shape[1]
 
   hidden = tuple(int(x) for x in args.hidden.split(',')) if args.hidden else tuple()
-  in_dim = C + 2  # features + (iy, ix)
-  model = Dino2GaussMLP(in_dim=in_dim, hidden_layers=hidden, offset_max=args.offset_max, k=args.k).to(device)
+  in_dim = C + 2  # features + (iy, ix) for MLP
+  in_channels = C + 2  # features + (gx, gy) for Conv
+  if args.arch == 'conv':
+    model = Dino2GaussConv(in_channels=in_channels, hidden=args.conv_hidden, offset_max=args.offset_max, k=args.k).to(device)
+  else:
+    model = Dino2GaussMLP(in_dim=in_dim, hidden_layers=hidden, offset_max=args.offset_max, k=args.k).to(device)
   opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
   config = RasterConfig(compute_point_heuristic=False, compute_visibility=False)
@@ -82,17 +88,23 @@ def main() -> None:
       H, W = target.shape[0], target.shape[1]
 
       anchors = build_anchors(H=H, W=W, Hf=Hf, Wf=Wf, stride=args.stride, device=device)
-      feats = gather_latents(features, stride=args.stride)
-      # add normalized coords
-      ys = torch.arange(0, Hf, args.stride, device=device).float() / float(Hf)
-      xs = torch.arange(0, Wf, args.stride, device=device).float() / float(Wf)
-      gy, gx = torch.meshgrid(ys, xs, indexing='ij')
-      coords = torch.stack([gx, gy], dim=-1).view(-1, 2)
-      x_in = torch.cat([feats.to(dtype=torch.float32), coords], dim=-1)
+      if args.arch == 'conv':
+        x_in = None  # not used in conv path
+      else:
+        feats = gather_latents(features, stride=args.stride)
+        # add normalized coords
+        ys = torch.arange(0, Hf, args.stride, device=device).float() / float(Hf)
+        xs = torch.arange(0, Wf, args.stride, device=device).float() / float(Wf)
+        gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+        coords = torch.stack([gx, gy], dim=-1).view(-1, 2)
+        x_in = torch.cat([feats.to(dtype=torch.float32), coords], dim=-1)
 
       opt.zero_grad(set_to_none=True)
       with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-        preds = model(x_in)
+        if args.arch == 'conv':
+          preds = model(features, stride=args.stride)
+        else:
+          preds = model(x_in)
         g2d = pack_gaussians(anchors, preds, image_size=(H, W))
         g2d_tensor = pack_gaussians_tensor(g2d)
         raster = rasterize(gaussians2d=g2d_tensor, depth=g2d.depths.clamp(0, 1), features=g2d.feature, image_size=(W, H), config=config)
@@ -109,7 +121,17 @@ def main() -> None:
     print(f'Epoch {epoch:03d} | loss {total_loss / n_pix:.6f} | PSNR {total_psnr / n_pix:.2f} dB')
 
   Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
-  torch.save(dict(model_state=model.state_dict(), in_dim=in_dim, hidden=hidden, offset_max=args.offset_max, k=args.k), args.save_ckpt)
+  ckpt: Dict[str, Any] = {
+    'model_state': model.state_dict(),
+    'arch': args.arch,
+    'offset_max': args.offset_max,
+    'k': args.k,
+  }
+  if args.arch == 'conv':
+    ckpt.update({'in_channels': in_channels, 'conv_hidden': args.conv_hidden})
+  else:
+    ckpt.update({'in_dim': in_dim, 'hidden': hidden})
+  torch.save(ckpt, args.save_ckpt)
   print(f'Saved checkpoint to {args.save_ckpt}')
 
 
