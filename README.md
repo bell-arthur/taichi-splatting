@@ -51,6 +51,52 @@ Fitting an image (split and prune to target): \
 
 See `--help` for other options.
 
+### DINO → Gaussians pipeline (new)
+
+Train a small MLP to predict 2D Gaussians from cached DINO features, infer Gaussians for a specific image, then render/refine in the example.
+
+1) Train MLP from cached features:
+
+```bash
+pixi run python -m taichi_splatting.dino2gauss.train \
+  --cache_dir /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11 \
+  --epochs 10 --stride 1 --hidden 128,128 --offset_max 64 --k 64 \
+  --opacity_reg 1e-6 --scale_reg 1e-3 \
+  --save_ckpt /csse/users/abe118/Documents/SENG402/taichi-splatting/models/dino2gauss_mlp_k64.pth
+```
+
+2) Infer Gaussians for one cached item:
+
+```bash
+pixi run python -m taichi_splatting.dino2gauss.infer \
+  --cache_item /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11/00000.pt \
+  --checkpoint /csse/users/abe118/Documents/SENG402/taichi-splatting/models/dino2gauss_mlp_k64.pth \
+  --stride 1 \
+  --out /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth
+```
+
+3) Render (optionally refine) from precomputed Gaussians:
+
+```bash
+pixi run python taichi_splatting/examples/fit_image_gaussians.py \
+  /csse/users/abe118/Documents/SENG402/scan_32/left/00000.jpg \
+  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth \
+  --skip_refine --show
+```
+
+Or brief refinement with split/prune:
+
+```bash
+pixi run python taichi_splatting/examples/fit_image_gaussians.py \
+  /csse/users/abe118/Documents/SENG402/scan_32/left/00000.jpg \
+  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth \
+  --iters 400 --prune --target 20000 --show
+```
+
+Notes:
+- Use the same DINO `--scale` and layer across caching, training, and inference.
+- Increase `--k` and `--offset_max` for denser coverage; reduce `--scale_reg`/`--opacity_reg` to allow larger/stronger Gaussians.
+
 ### benchmarks
 
 There exist benchmarks to evaluate performance on individual components in isolation under `taichi_splatting/benchmarks/`

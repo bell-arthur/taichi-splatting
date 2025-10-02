@@ -64,6 +64,12 @@ def parse_args():
 
     parser.add_argument('--profile', action='store_true')
 
+    # New: initialize from precomputed DINO->Gaussians
+    parser.add_argument('--init_from_dino_gaussians', type=str, default=None,
+                        help='Path to gaussians.pth from dino2gauss.infer')
+    parser.add_argument('--skip_refine', action='store_true',
+                        help='If set, render-only without optimization')
+
     for attr in ['position', 'feature', 'covariance', 'alpha']:
         parser.add_argument(f'--use_mlp_{attr}', action='store_true')
         parser.add_argument(f'--freeze_mlp_{attr}', action='store_true')
@@ -366,13 +372,37 @@ def main():
     lr_range = (cmd_args.max_lr, cmd_args.min_lr)
 
     torch.cuda.random.manual_seed(cmd_args.seed)
-    gaussians = random_2d_gaussians(
-        cmd_args.n,
-        (w, h),
-        alpha_range=(0.5, 1.0),
-        scale_factor=0.5,
-        latent_dim=cmd_args.latent_dim,
-    ).to(device)
+    if cmd_args.init_from_dino_gaussians:
+        gdata = torch.load(cmd_args.init_from_dino_gaussians, map_location=device)
+        gaussians = Gaussians2D(
+            position=gdata['position'].to(device),
+            depths=gdata['depths'].to(device),
+            log_scaling=gdata['log_scaling'].to(device),
+            rotation=gdata['rotation'].to(device),
+            alpha_logit=gdata['alpha_logit'].to(device).squeeze(-1),
+            feature=gdata['feature'].to(device),
+            latent=torch.zeros((gdata['position'].shape[0], 1), device=device),
+            batch_size=(gdata['position'].shape[0],)
+        ).to(device)
+        print(f'Loaded {gaussians.batch_size[0]} gaussians from {cmd_args.init_from_dino_gaussians}')
+
+        # Adjust render/target resolution to match cached features' target size
+        if 'image_size' in gdata:
+            gh, gw = gdata['image_size']
+            if (h, w) != (gh, gw):
+                # Resize reference image for consistent loss/rendering
+                ref_image = cv2.resize(ref_image, (gw, gh), interpolation=cv2.INTER_AREA)
+                h, w = gh, gw
+                if cmd_args.show:
+                    cv2.resizeWindow('rendered', w, h)
+    else:
+        gaussians = random_2d_gaussians(
+            cmd_args.n,
+            (w, h),
+            alpha_range=(0.5, 1.0),
+            scale_factor=0.5,
+            latent_dim=cmd_args.latent_dim,
+        ).to(device)
 
     mlps = {}
     mlp_optimizers = {}
@@ -519,6 +549,9 @@ def main():
 
         pbar.set_postfix(**metrics)
 
+        if cmd_args.skip_refine:
+            # Render-only mode: break after first render
+            break
         iteration += epoch_size
         pbar.update(epoch_size)
 
