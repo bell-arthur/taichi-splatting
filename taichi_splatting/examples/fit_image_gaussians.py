@@ -8,11 +8,13 @@ import cv2
 import taichi as ti
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from beartype import beartype
 from logger_utils import TrainingLogger
 from mlp_predictors import ConfigurableMLP
 from torch.profiler import ProfilerActivity, profile, record_function
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from taichi_splatting.data_types import Gaussians2D, RasterConfig
 from taichi_splatting.misc.renderer2d import (point_basis, project_gaussians2d,
@@ -64,11 +66,13 @@ def parse_args():
 
     parser.add_argument('--profile', action='store_true')
 
-    # New: initialize from precomputed DINO->Gaussians
+    # Initialise from precomputed DINO->Gaussians
     parser.add_argument('--init_from_dino_gaussians', type=str, default=None,
                         help='Path to gaussians.pth from dino2gauss.infer')
     parser.add_argument('--skip_refine', action='store_true',
                         help='If set, render-only without optimization')
+    parser.add_argument('--save_render', type=str, default=None,
+                        help='If set with --skip_refine, save final render to this image path and exit')
 
     for attr in ['position', 'feature', 'covariance', 'alpha']:
         parser.add_argument(f'--use_mlp_{attr}', action='store_true')
@@ -84,6 +88,12 @@ def parse_args():
                         help='Filename to save training log as CSV')
 
     parser.add_argument('--use_hash_encoding', action='store_true')
+
+    # TensorBoard logging options
+    parser.add_argument('--tb_log_dir', type=str, default=None,
+                        help='Enable TensorBoard logging to this directory')
+    parser.add_argument('--tb_every', type=int, default=25,
+                        help='Log histograms every N iterations')
 
     args = parser.parse_args()
 
@@ -127,13 +137,16 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 opacity_reg=0.0,
                 scale_reg=0.0,
                 mlps: Optional[dict] = None,
-                mlp_optimizers: Optional[dict] = None):
+                mlp_optimizers: Optional[dict] = None,
+                writer: Optional[SummaryWriter] = None,
+                step_counter: Optional[dict] = None,
+                tb_every: int = 25):
 
     h, w = ref_image.shape[:2]
 
     point_heuristic = torch.zeros(
         (params.batch_size[0], 2), device=params.position.device)
-    image = torch.zeros_like(ref_image)  # Initialize image
+    image = torch.zeros_like(ref_image)
 
     if mlps is None:
         mlps = {}
@@ -165,6 +178,19 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                     input_feature = params.latent
 
                 input_feature = input_feature.to(dtype=torch.float32, device=_device)
+                # Per-level HashGrid diagnostics
+                if writer is not None and _mlp.use_hash_encoding and step_counter is not None:
+                    if (step_counter['i'] % tb_every) == 0:
+                        enc = _mlp.encode_only(input_feature)
+                        hc = getattr(_mlp, 'hash_config', None)
+                        if hc is not None:
+                            L = int(hc.get('n_levels', 1))
+                            Fpl = int(hc.get('n_features_per_level', enc.shape[-1]))
+                            for li in range(L):
+                                s, e = li * Fpl, (li + 1) * Fpl
+                                writer.add_histogram(
+                                    f"mlp_feature/enc/level_{li}", enc[:, s:e].detach().float(),
+                                    global_step=step_counter['i'])
                 gaussians.feature = _mlp(
                     input_feature).contiguous().to(torch.float32)
             else:
@@ -179,6 +205,18 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                     input_cov = params.latent
 
                 input_cov = input_cov.to(dtype=torch.float32, device=_device)
+                if writer is not None and _mlp.use_hash_encoding and step_counter is not None:
+                    if (step_counter['i'] % tb_every) == 0:
+                        enc = _mlp.encode_only(input_cov)
+                        hc = getattr(_mlp, 'hash_config', None)
+                        if hc is not None:
+                            L = int(hc.get('n_levels', 1))
+                            Fpl = int(hc.get('n_features_per_level', enc.shape[-1]))
+                            for li in range(L):
+                                s, e = li * Fpl, (li + 1) * Fpl
+                                writer.add_histogram(
+                                    f"mlp_covariance/enc/level_{li}", enc[:, s:e].detach().float(),
+                                    global_step=step_counter['i'])
                 cov_out = _mlp(
                     input_cov).contiguous().to(torch.float32)
                 gaussians.log_scaling = torch.clamp(
@@ -196,6 +234,18 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                 else:
                     input_alpha = params.latent
                 input_alpha = input_alpha.to(dtype=torch.float32, device=_device)
+                if writer is not None and _mlp.use_hash_encoding and step_counter is not None:
+                    if (step_counter['i'] % tb_every) == 0:
+                        enc = _mlp.encode_only(input_alpha)
+                        hc = getattr(_mlp, 'hash_config', None)
+                        if hc is not None:
+                            L = int(hc.get('n_levels', 1))
+                            Fpl = int(hc.get('n_features_per_level', enc.shape[-1]))
+                            for li in range(L):
+                                s, e = li * Fpl, (li + 1) * Fpl
+                                writer.add_histogram(
+                                    f"mlp_alpha/enc/level_{li}", enc[:, s:e].detach().float(),
+                                    global_step=step_counter['i'])
                 gaussians.alpha_logit = _mlp(input_alpha).squeeze(-1)
             else:
                 gaussians.alpha_logit = params.alpha_logit
@@ -216,6 +266,13 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
                     scale_reg * scale.pow(2).mean())
 
             loss.backward()
+            # Log parameter and gradient histograms
+            if writer is not None and step_counter is not None and (step_counter['i'] % tb_every) == 0:
+                for name, _mlp in mlps.items():
+                    for pname, p in _mlp.named_parameters():
+                        writer.add_histogram(f"mlp_{name}/weights/{pname}", p.detach().float(), global_step=step_counter['i'])
+                        if p.grad is not None:
+                            writer.add_histogram(f"mlp_{name}/grads/{pname}", p.grad.detach().float(), global_step=step_counter['i'])
             for optim in mlp_optimizers.values():
                 optim.step()
 
@@ -251,6 +308,9 @@ def train_epoch(opt: FractionalAdam, params: ParameterClass, ref_image,
             )
 
         point_heuristic += raster.point_heuristic  # type: ignore[operator]
+
+        if writer is not None and step_counter is not None:
+            step_counter['i'] += 1
 
     return image, (point_heuristic[:, 0], point_heuristic[:, 1])
 
@@ -352,6 +412,11 @@ def main():
     cmd_args = parse_args()
     device = torch.device('cuda:0')
 
+    writer: Optional[SummaryWriter] = None
+    if cmd_args.tb_log_dir:
+        writer = SummaryWriter(log_dir=cmd_args.tb_log_dir)
+        print(f"TensorBoard logging to {cmd_args.tb_log_dir}")
+
     torch.set_grad_enabled(False)
 
     ref_image = cv2.imread(cmd_args.image_file)
@@ -364,7 +429,7 @@ def main():
 
     print(f'Image size: {w}x{h}')
 
-    if cmd_args.show:
+    if cmd_args.show and not (cmd_args.skip_refine and cmd_args.save_render):
         cv2.namedWindow('rendered', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('rendered', w, h)
 
@@ -406,6 +471,16 @@ def main():
 
     mlps = {}
     mlp_optimizers = {}
+    step_counter = {'i': 0}
+
+    def register_activation_hooks(name: str, model: ConfigurableMLP):
+        if writer is None:
+            return
+        for idx, module in enumerate(model.mlp):
+            if isinstance(module, (nn.ReLU, nn.LeakyReLU, nn.SiLU, nn.ELU, nn.GELU, nn.Tanh, nn.Sigmoid, nn.Softplus)):
+                module.register_forward_hook(
+                    lambda m, inp, out, n=name, i=idx: writer.add_histogram(
+                        f"mlp_{n}/act/{m.__class__.__name__}_{i}", out.detach().float(), global_step=step_counter['i']))
 
     for attr in ['position', 'feature', 'covariance', 'alpha']:
         if getattr(cmd_args, f'use_mlp_{attr}'):
@@ -440,6 +515,7 @@ def main():
                 mlp_optimizers[attr] = optimizer
 
             mlps[attr] = mlp
+            register_activation_hooks(attr, mlp)
 
     parameter_groups = {}
     if not cmd_args.use_mlp_position:
@@ -507,10 +583,13 @@ def main():
             opacity_reg=cmd_args.opacity_reg,
             scale_reg=cmd_args.scale_reg,
             mlps=mlps,
-            mlp_optimizers=mlp_optimizers
+            mlp_optimizers=mlp_optimizers,
+            writer=writer,
+            step_counter=step_counter,
+            tb_every=cmd_args.tb_every
         )
 
-        if cmd_args.show:
+        if cmd_args.show and not (cmd_args.skip_refine and cmd_args.save_render):
             display_image('rendered', image)
 
         if cmd_args.write_frames:
@@ -550,7 +629,15 @@ def main():
         pbar.set_postfix(**metrics)
 
         if cmd_args.skip_refine:
-            # Render-only mode: break after first render
+            # Render-only mode: save or show once, then exit
+            if cmd_args.save_render:
+                out_path = Path(cmd_args.save_render)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_path), (image.detach().clamp(0, 1) * 255).cpu().numpy())
+                print(f'Saved render to {out_path}')
+            else:
+                if cmd_args.show:
+                    display_image('rendered', image)
             break
         iteration += epoch_size
         pbar.update(epoch_size)
@@ -559,6 +646,10 @@ def main():
 
     if cmd_args.save_csv:
         logger.save_csv(cmd_args.save_csv)
+
+    if writer is not None:
+        writer.flush()
+        writer.close()
 
     for attr, mlp in mlps.items():
         path = getattr(cmd_args, f'save_mlp_{attr}')

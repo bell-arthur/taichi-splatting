@@ -19,8 +19,8 @@ from taichi_splatting.taichi_queue import TaichiQueue
 
 def load_cache_item(path: Path, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, dict]:
   data: Dict[str, Any] = torch.load(path, map_location='cpu')
-  features: torch.Tensor = data['features']        # (Hf,Wf,C), likely bfloat16
-  target: torch.Tensor = data['target']            # (H,W,3) float in [0,1]
+  features: torch.Tensor = data['features']
+  target: torch.Tensor = data['target']
   meta: dict = data.get('meta', {})
   return features.to(device), target.to(device), meta
 
@@ -48,11 +48,12 @@ def main() -> None:
   parser.add_argument('--device', type=str, default='cuda')
   parser.add_argument('--arch', type=str, choices=['mlp', 'conv'], default='mlp')
   parser.add_argument('--conv_hidden', type=int, default=128)
+  parser.add_argument('--conv_layers', type=int, default=1)
   args = parser.parse_args()
 
   device = torch.device(args.device if torch.cuda.is_available() and 'cuda' in args.device else 'cpu')
 
-  # Initialize Taichi runtime/queue (required before rasterization)
+  # Initialise Taichi runtime/queue (required before rasterisation)
   TaichiQueue.init(arch=ti.cuda if device.type == 'cuda' else ti.cpu,
                    log_level=ti.INFO,
                    device_memory_GB=0.1,
@@ -71,7 +72,7 @@ def main() -> None:
   in_dim = C + 2  # features + (iy, ix) for MLP
   in_channels = C + 2  # features + (gx, gy) for Conv
   if args.arch == 'conv':
-    model = Dino2GaussConv(in_channels=in_channels, hidden=args.conv_hidden, offset_max=args.offset_max, k=args.k).to(device)
+    model = Dino2GaussConv(in_channels=in_channels, hidden=args.conv_hidden, offset_max=args.offset_max, k=args.k, conv_layers=args.conv_layers).to(device)
   else:
     model = Dino2GaussMLP(in_dim=in_dim, hidden_layers=hidden, offset_max=args.offset_max, k=args.k).to(device)
   opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -92,7 +93,7 @@ def main() -> None:
         x_in = None  # not used in conv path
       else:
         feats = gather_latents(features, stride=args.stride)
-        # add normalized coords
+        # add normalised coords
         ys = torch.arange(0, Hf, args.stride, device=device).float() / float(Hf)
         xs = torch.arange(0, Wf, args.stride, device=device).float() / float(Wf)
         gy, gx = torch.meshgrid(ys, xs, indexing='ij')
@@ -128,7 +129,7 @@ def main() -> None:
     'k': args.k,
   }
   if args.arch == 'conv':
-    ckpt.update({'in_channels': in_channels, 'conv_hidden': args.conv_hidden})
+    ckpt.update({'in_channels': in_channels, 'conv_hidden': args.conv_hidden, 'conv_layers': args.conv_layers})
   else:
     ckpt.update({'in_dim': in_dim, 'hidden': hidden})
   torch.save(ckpt, args.save_ckpt)
@@ -137,5 +138,3 @@ def main() -> None:
 
 if __name__ == '__main__':
   main()
-
-

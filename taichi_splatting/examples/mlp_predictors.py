@@ -7,6 +7,7 @@ class ConfigurableMLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_layers: Optional[List[int]] = None, activation: str = 'ReLU', use_hash_encoding: bool = False, hash_config: Optional[dict] = None):
         super().__init__()
         self.use_hash_encoding = use_hash_encoding
+        self.hash_config = None
         if hidden_layers is None:
             hidden_layers = [32]
 
@@ -21,6 +22,7 @@ class ConfigurableMLP(nn.Module):
                     "per_level_scale": 2.0
                 }
 
+            self.hash_config = hash_config
             self.encoder = tcnn.Encoding(
                 n_input_dims=2, encoding_config=hash_config)
             input_dim = self.encoder.n_output_dims
@@ -37,6 +39,15 @@ class ConfigurableMLP(nn.Module):
             first_param = next(self.mlp.parameters())
             x = x.to(dtype=first_param.dtype, device=first_param.device)
         return self.mlp(x)
+
+    def encode_only(self, x):
+        """Return encoded inputs (useful for diagnostics/logging).
+        Requires use_hash_encoding=True.
+        """
+        assert self.use_hash_encoding and self.encoder is not None
+        y = self.encoder(x)  # type: ignore[misc]
+        first_param = next(self.mlp.parameters())
+        return y.to(dtype=first_param.dtype, device=first_param.device)
 
     @staticmethod
     def _get_activation(name: str):
@@ -67,7 +78,7 @@ class ConfigurableMLP(nn.Module):
 
         mlp = nn.Sequential(*layers)
 
-        # Kaiming initialization for hidden layers (leaves output as default)
+        # Kaiming initialisation for hidden layers (leaves output as default)
         for idx, module in enumerate(mlp):
             if isinstance(module, nn.Linear):
                 # Use fan_in for ReLU-like activations

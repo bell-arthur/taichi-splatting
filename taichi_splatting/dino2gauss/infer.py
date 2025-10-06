@@ -12,8 +12,8 @@ from taichi_splatting.dino2gauss.utils import build_anchors, gather_latents, pac
 
 def load_cache_item(path: Path, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, dict]:
   data: Dict[str, Any] = torch.load(path, map_location='cpu')
-  features: torch.Tensor = data['features']        # (Hf,Wf,C)
-  target: torch.Tensor = data['target']            # (H,W,3)
+  features: torch.Tensor = data['features']
+  target: torch.Tensor = data['target']
   meta: dict = data.get('meta', {})
   return features.to(device), target.to(device), meta
 
@@ -28,6 +28,7 @@ def build_model_from_ckpt(ckpt_path: Path, device: torch.device):
       hidden=int(ckpt.get('conv_hidden', 128)),
       offset_max=float(ckpt['offset_max']),
       k=k,
+      conv_layers=int(ckpt.get('conv_layers', 1)),
     )
   else:
     model = Dino2GaussMLP(
@@ -96,5 +97,3 @@ def main() -> None:
 
 if __name__ == '__main__':
   main()
-
-

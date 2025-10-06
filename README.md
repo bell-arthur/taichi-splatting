@@ -53,34 +53,47 @@ See `--help` for other options.
 
 ### DINO → Gaussians pipeline (new)
 
-Train a small MLP to predict 2D Gaussians from cached DINO features, infer Gaussians for a specific image, then render/refine in the example.
+Train a small head (MLP or Convolutional) to predict 2D Gaussians from cached DINO features, infer Gaussians for a specific image, then render/refine in the example.
 
-1) Train MLP from cached features:
+1) Train from cached features:
+
+MLP head:
 
 ```bash
 pixi run python -m taichi_splatting.dino2gauss.train \
-  --cache_dir /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11 \
-  --epochs 10 --stride 1 --hidden 128,128 --offset_max 64 --k 64 \
+  --cache_dir /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11_s025 \
+  --epochs 10 --stride 1 --hidden 256,128 --offset_max 64 --k 64 \
   --opacity_reg 1e-6 --scale_reg 1e-3 \
-  --save_ckpt /csse/users/abe118/Documents/SENG402/taichi-splatting/models/dino2gauss_mlp_k64.pth
+  --save_ckpt /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/dino2gauss_mlp_k64.pth
 ```
 
-2) Infer Gaussians for one cached item:
+Convolutional head:
+
+```bash
+pixi run python -m taichi_splatting.dino2gauss.train \
+  --arch conv \
+  --cache_dir /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11_s025 \
+  --epochs 10 --stride 1 --conv_hidden 128 --conv_layers 3 --offset_max 64 --k 64 \
+  --opacity_reg 1e-6 --scale_reg 1e-3 \
+  --save_ckpt /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/dino2gauss_conv_k64.pth
+```
+
+2) Infer Gaussians for one cached item (MLP or Conv):
 
 ```bash
 pixi run python -m taichi_splatting.dino2gauss.infer \
-  --cache_item /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11/00000.pt \
-  --checkpoint /csse/users/abe118/Documents/SENG402/taichi-splatting/models/dino2gauss_mlp_k64.pth \
+  --cache_item /csse/users/abe118/Documents/SENG402/dino-viewer/cache/vits16_l11_s025/00000.pt \
+  --checkpoint /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/dino2gauss_conv_k64.pth \
   --stride 1 \
-  --out /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth
+  --out /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/gaussians_00000_k64.pth
 ```
 
 3) Render (optionally refine) from precomputed Gaussians:
 
 ```bash
 pixi run python taichi_splatting/examples/fit_image_gaussians.py \
-  /csse/users/abe118/Documents/SENG402/scan_32/left/00000.jpg \
-  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth \
+  /csse/users/abe118/Documents/SENG402/scan_32/right/00000.jpg \
+  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/gaussians_00000_k64.pth \
   --skip_refine --show
 ```
 
@@ -88,14 +101,34 @@ Or brief refinement with split/prune:
 
 ```bash
 pixi run python taichi_splatting/examples/fit_image_gaussians.py \
-  /csse/users/abe118/Documents/SENG402/scan_32/left/00000.jpg \
-  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/models/gaussians_00000_k64.pth \
+  /csse/users/abe118/Documents/SENG402/scan_32/right/00000.jpg \
+  --init_from_dino_gaussians /csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/dino2gauss/models/gaussians_00000_k64.pth \
   --iters 400 --prune --target 20000 --show
 ```
 
 Notes:
 - Use the same DINO `--scale` and layer across caching, training, and inference.
 - Increase `--k` and `--offset_max` for denser coverage; reduce `--scale_reg`/`--opacity_reg` to allow larger/stronger Gaussians.
+- Inference auto-detects architecture and hyperparameters from the checkpoint (including conv hidden size and layer count).
+
+#### Convolutional dino2gauss (details)
+
+- Inputs: feature grid `(Hf, Wf, C)` from DINO, plus two coordinate channels `(gx, gy)` in `[0,1]` concatenated as additional input channels.
+- Stem: a stack of `conv_layers` blocks of `3×3 conv (hidden) + ReLU` (configurable with `--conv_hidden` and `--conv_layers`).
+- Heads: five `1×1` conv heads produce per-cell parameter maps:
+  - `pos_offset` `(dx, dy)` (tanh-scaled by `offset_max`)
+  - `log_scaling` `(sx, sy)` (clamped to `[-5,5]`)
+  - `rotation` `(rx, ry)` (normalised to unit length)
+  - `alpha_logit` `(1)`
+  - `color` `(r,g,b)` via sigmoid
+- Stride: maps are optionally sub-sampled by `--stride`; each retained feature cell anchors one or more Gaussians.
+- K Gaussians per cell: set with `--k`; outputs are shaped `(N, K, ·)` then flattened to `(N×K, ·)` for rasterisation.
+- Anchors: pixel centers are built for `(H, W)` and aligned to the `(Hf, Wf)` grid and stride; final 2D positions are `anchor + pos_offset`.
+- Rasterisation: parameters are packed and rendered with the Taichi 2D rasteriser to match the target image.
+
+Usage tips:
+- To reduce visible grid patterns, consider `--stride 1` and/or increasing `--conv_layers` and `--k`.
+- `--offset_max` bounds per-cell offsets; increase for more flexibility, balance with `--scale_reg`/`--opacity_reg`.
 
 ### benchmarks
 
@@ -105,6 +138,26 @@ There exist benchmarks to evaluate performance on individual components in isola
 
 Tests (gradient tests and tests comparing to torch-based reference implementations) can be run with pytest, or individually under 
 `taichi_splatting/tests/`
+
+### TensorBoard (training visualisation)
+
+Visualise MLP activations/weights/gradients and per-level HashGrid encodings.
+
+Install TensorBoard:
+
+```bash
+python -m pip install tensorboard
+```
+
+Run training with TensorBoard:
+
+```bash
+python taichi_splatting/examples/fit_image_gaussians.py \
+  /csse/users/abe118/Documents/SENG402/scan_32/left/00000.jpg \
+  --use_mlp_feature --use_mlp_covariance --use_mlp_alpha --use_hash_encoding \
+  --tb_log_dir /csse/users/abe118/Documents/SENG402/outputs/tb \
+  --tb_every 25
+```
 
 ### splat-viewer
 
