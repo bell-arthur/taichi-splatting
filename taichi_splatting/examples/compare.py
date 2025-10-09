@@ -6,7 +6,7 @@ import pandas as pd
 
 
 def plot_all_logs():
-    csv_files = glob.glob("*.csv")
+    csv_files = glob.glob("/csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/examples/outputs/mlp/*.csv")
     plt.figure(figsize=(10, 6))
     for file in csv_files:
         df = pd.read_csv(file)

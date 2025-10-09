@@ -73,13 +73,15 @@ def parse_args():
                         help='If set, render-only without optimization')
     parser.add_argument('--save_render', type=str, default=None,
                         help='If set with --skip_refine, save final render to this image path and exit')
+    parser.add_argument('--save_last_frame', type=str, default=None,
+                        help='If set, save the final rendered image at the end of the run')
 
     for attr in ['position', 'feature', 'covariance', 'alpha']:
         parser.add_argument(f'--use_mlp_{attr}', action='store_true')
         parser.add_argument(f'--freeze_mlp_{attr}', action='store_true')
         parser.add_argument(f'--load_mlp_{attr}', type=str, default=None)
         parser.add_argument(f'--save_mlp_{attr}', type=str, default=None)
-        parser.add_argument(f'--mlp_{attr}_layers', type=str, default="32")
+        parser.add_argument(f'--mlp_{attr}_layers', type=str, default="64,64")
         parser.add_argument(
             f'--mlp_{attr}_activation', type=str, default="ReLU")
 
@@ -630,8 +632,8 @@ def main():
 
         if cmd_args.skip_refine:
             # Render-only mode: save or show once, then exit
-            if cmd_args.save_render:
-                out_path = Path(cmd_args.save_render)
+            if cmd_args.save_render or cmd_args.save_last_frame:
+                out_path = Path(cmd_args.save_render or cmd_args.save_last_frame)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(out_path), (image.detach().clamp(0, 1) * 255).cpu().numpy())
                 print(f'Saved render to {out_path}')
@@ -643,6 +645,13 @@ def main():
         pbar.update(epoch_size)
 
     # logger.plot()
+
+    # Save last frame after training (non-skip_refine mode)
+    if (not cmd_args.skip_refine) and cmd_args.save_last_frame:
+        out_path = Path(cmd_args.save_last_frame)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), (image.detach().clamp(0, 1) * 255).cpu().numpy())
+        print(f'Saved final frame to {out_path}')
 
     if cmd_args.save_csv:
         logger.save_csv(cmd_args.save_csv)
