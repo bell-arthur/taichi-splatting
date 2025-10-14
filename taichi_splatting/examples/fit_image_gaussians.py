@@ -385,6 +385,15 @@ def split_prune(params: ParameterClass, t, target, prune_rate, split_heuristic: 
                                               prune_cost=prune_cost,
                                               densify_score=split_score)
 
+    # If nothing to split, skip splitting to avoid constructing an empty ParameterClass
+    if split_mask.sum().item() == 0:
+        # Only prune in this step
+        params = params[~prune_mask]
+        return params, dict(
+            split=0,
+            prune=prune_mask.sum().item()
+        )
+
     to_split = params[split_mask]
 
     splits = uniform_split_gaussians2d(

@@ -14,7 +14,8 @@ def ema(x, alpha):
     return out
 
 def find_convergence(df, method="threshold", tol=0.1, rel=0.98,
-                     slope_window=10, slope_delta=0.02, smooth_alpha=0.0):
+                     slope_window=10, slope_delta=0.02, smooth_alpha=0.0,
+                     pick="first"):
     s = df["psnr"].copy()
     s = pd.Series(ema(s, smooth_alpha), index=s.index)
 
@@ -33,7 +34,10 @@ def find_convergence(df, method="threshold", tol=0.1, rel=0.98,
     elif method == "slope":
         diffs = s.diff().abs()
         roll = diffs.rolling(slope_window, min_periods=slope_window).mean()
-        hits = roll.index[(roll < slope_delta)]
+        plateau_mask = (roll < slope_delta)
+        # rising edges into low-slope region (start of plateau)
+        transitions = plateau_mask & ~plateau_mask.shift(1, fill_value=False)
+        hits = transitions.index[transitions]
     else:
         raise ValueError("Unknown method")
 
@@ -48,7 +52,7 @@ def find_convergence(df, method="threshold", tol=0.1, rel=0.98,
             convergence_psnr=None,
         )
 
-    conv_idx = int(hits[0])
+    conv_idx = int(hits[0] if pick == "first" else hits[-1])
     return dict(
         best_psnr=best_psnr,
         best_iter=best_iter,
@@ -66,10 +70,9 @@ def process_file(file, args):
     result = find_convergence(
         df, method=args.method, tol=args.tol, rel=args.rel,
         slope_window=args.slope_window, slope_delta=args.slope_delta,
-        smooth_alpha=args.ema,
+        smooth_alpha=args.ema, pick=args.pick,
     )
     result["filename"] = file.name
-    result["method"] = args.method
     return result
 
 def main():
@@ -83,7 +86,12 @@ def main():
     ap.add_argument("--slope-window", type=int, default=10)
     ap.add_argument("--slope-delta", type=float, default=0.02)
     ap.add_argument("--ema", type=float, default=0.0)
+    ap.add_argument("--pick", choices=["first","last"], default="first",
+                    help="Select first or last detected plateau/crossing")
     args = ap.parse_args()
+
+    def fmt2(x):
+        return f"{x:.2f}" if x is not None and not pd.isna(x) else "NA"
 
     if args.input.is_dir():
         files = sorted(args.input.glob("*.csv"))
@@ -98,12 +106,23 @@ def main():
             res = process_file(f, args)
             results.append(res)
             print(f"[OK] {f.name}: converged={res['converged']} "
-                  f"at iter={res['convergence_iter']} (PSNR={res['convergence_psnr']})")
+                  f"at iter={res['convergence_iter']} (PSNR={fmt2(res['convergence_psnr'])})")
         except Exception as e:
             print(f"[ERROR] {f.name}: {e}")
 
     if results:
-        pd.DataFrame(results).to_csv(args.out, index=False)
+        df = pd.DataFrame(results)
+        cols = [
+            "filename",
+            "convergence_iter",
+            "convergence_time",
+            "convergence_psnr",
+            "best_iter",
+            "best_time",
+            "best_psnr",
+        ]
+        df = df.reindex(columns=cols)
+        df.to_csv(args.out, index=False, float_format="%.2f")
         print(f"\nSaved summary to {args.out.resolve()}")
     else:
         print("No valid CSVs processed.")

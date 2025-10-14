@@ -6,8 +6,8 @@ import pandas as pd
 
 
 def plot_all_logs():
-    csv_files = glob.glob("/csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/examples/outputs/mlp/*.csv")
-    plt.figure(figsize=(10, 6))
+    csv_files = glob.glob("/csse/users/abe118/Documents/SENG402/taichi-splatting/taichi_splatting/examples/outputs/mlp_hash/*.csv")
+    plt.figure(figsize=(10, 8))
     for file in csv_files:
         df = pd.read_csv(file)
         label = os.path.splitext(os.path.basename(file))[0]
@@ -19,7 +19,7 @@ def plot_all_logs():
     plt.legend()
     plt.show()
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10, 8))
     for file in csv_files:
         df = pd.read_csv(file)
         label = os.path.splitext(os.path.basename(file))[0]
